@@ -29,7 +29,7 @@ class ForwardReader(Star):
     @filter.event_message_type(filter.EventMessageType.ALL) 
     async def on_any_message(self, event: AstrMessageEvent, *args, **kwargs): 
         """ 
-        监听所有消息，在满足“回复转发”或“直接发送转发”且“唤醒机器人”的条件下进行分析。 
+        监听所有消息，如果发现是针对合并转发的提问，则提取内容并请求LLM分析。 
         """ 
         if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent): 
             return 
@@ -37,9 +37,11 @@ class ForwardReader(Star):
         forward_id: Optional[str] = None 
         reply_seg: Optional[Comp.Reply] = None 
         user_query: str = event.message_str.strip() 
+        
+        # 用于存储从 JSON 中直接解析出的内容
+        json_extracted_texts = [] 
 
         is_bot_awaken = event.is_at_or_wake_command
-        
         is_default_wake_trigger = not self.enable_direct_analysis and not self.enable_reply_analysis and is_bot_awaken
 
         if not self.enable_direct_analysis and not self.enable_reply_analysis and not is_bot_awaken:
@@ -62,35 +64,75 @@ class ForwardReader(Star):
         if (self.enable_reply_analysis or is_bot_awaken) and not forward_id and reply_seg: 
             try: 
                 client = event.bot 
-                original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id) 
-                
+                original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
                 if original_msg and 'message' in original_msg: 
                     original_message_chain = original_msg['message'] 
+                    
                     if isinstance(original_message_chain, list): 
                         for segment in original_message_chain: 
-                            if isinstance(segment, dict) and segment.get("type") == "forward": 
+                            seg_type = segment.get("type")
+
+                            # 兼容处理 1: 原始的 forward 类型
+                            if seg_type == "forward": 
                                 forward_id = segment.get("data", {}).get("id") 
-                                
                                 if forward_id:
-                                    if not user_query: 
+                                    if not user_query:
                                         user_query = "请总结一下这个聊天记录" 
-                                    break 
+                                    break
+                            
+                            # 兼容处理 2: JSON 类型，直接提取内容，不设置 forward_id
+                            elif seg_type == "json":
+                                try:
+                                    inner_data_str = segment.get("data", {}).get("data")
+                                    if inner_data_str:
+                                        # 处理 HTML 实体编码
+                                        inner_data_str = inner_data_str.replace("&#44;", ",")
+                                        inner_json = json.loads(inner_data_str)
+                                        
+                                        # 检查是否为合并转发的 JSON 结构
+                                        if inner_json.get("app") == "com.tencent.multimsg" and inner_json.get("config", {}).get("forward") == 1:
+                                            news_items = inner_json.get("meta", {}).get("detail", {}).get("news", [])
+                                            
+                                            for item in news_items:
+                                                text_content = item.get("text")
+                                                if text_content:
+                                                    clean_text = text_content.strip().replace("[图片]", "").strip()
+                                                    if clean_text:
+                                                        json_extracted_texts.append(clean_text)
+                                            
+                                            logger.info(f"直接从 JSON 中提取到 {len(json_extracted_texts)} 条文本内容，放弃 API 调用。")
+                                            
+                                            if json_extracted_texts:
+                                                if not user_query: 
+                                                    user_query = "请总结一下这个聊天记录"
+                                                break
+
+                                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                                    logger.debug(f"解析 JSON 消息内容失败: {e}")
+                                    continue
+                        
 
             except Exception as e: 
                 logger.warning(f"获取被回复消息详情失败: {e}") 
 
-        # 最终触发：找到转发ID AND 用户有明确的提问
-        if forward_id and user_query:
+        if (forward_id or json_extracted_texts) and user_query:
             try: 
+                # 控制是否静默响应
                 if not is_default_wake_trigger:
                     await event.send(event.chain_result([Comp.Reply(id=event.message_obj.message_id), Comp.Plain("正在分析聊天记录，请稍候...")])) 
 
                 # 1. 提取合并转发内容 
-                extracted_texts, image_urls = await self._extract_forward_content(event, forward_id) 
+                image_urls = []
+                if forward_id:
+                    extracted_texts, image_urls = await self._extract_forward_content(event, forward_id) 
+                else:
+                    # JSON 转发：使用已提取的内容
+                    extracted_texts = json_extracted_texts
+                
                 if not extracted_texts and not image_urls: 
                     yield event.plain_result("无法从合并转发消息中提取到任何有效内容。") 
                     return 
-
+                
                 # 2. 构建用于LLM分析的最终提示词 
                 chat_records = "\n".join(extracted_texts) 
                 final_prompt = ( 
@@ -101,7 +143,6 @@ class ForwardReader(Star):
                     f"--- 聊天记录结束 ---" 
                 ) 
 
-                # 保留 info 日志输出
                 logger.info(f"ForwardReader: 准备向LLM发送请求，Prompt长度: {len(final_prompt)}, 图片数量: {len(image_urls)}") 
 
                 # 3. [核心] 使用 event.request_llm() 发起请求 
@@ -119,7 +160,7 @@ class ForwardReader(Star):
         
     async def _extract_forward_content(self, event: AiocqhttpMessageEvent, forward_id: str) -> tuple[list[str], list[str]]:  
         """ 
-        从合并转发消息中提取文本和图片URL。 
+        从合并转发消息中提取文本和图片URL。 (仅用于标准 forward ID)
         """ 
         client = event.bot 
         try: 

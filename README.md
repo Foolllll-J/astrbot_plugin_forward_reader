@@ -1,4 +1,4 @@
-# Forward Reader - 智能合并转发分析插件 (v1.2.0)
+# Forward Reader - 智能合并转发分析插件 (v1.2.1)
 
 一个为 [AstrBot](https://github.com/Soulter/AstrBot) 设计的插件，可以像真人一样，智能地分析和总结 QQ 中的合并转发消息，并与用户进行自然语言交互。
 
