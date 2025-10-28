@@ -15,7 +15,7 @@ except ImportError:
     IS_AIOCQHTTP = False 
 
 
-@register("forward_reader", "EraAsh", "一个使用 LLM 分析合并转发消息内容的插件", "1.2.1", "https://github.com/EraAsh/astrbot_plugin_forward_reader") 
+@register("forward_reader", "EraAsh", "一个使用 LLM 分析合并转发消息内容的插件", "1.2.2", "https://github.com/EraAsh/astrbot_plugin_forward_reader") 
 class ForwardReader(Star): 
     def __init__(self, context: Context, config: AstrBotConfig): 
         super().__init__(context) 
@@ -23,47 +23,45 @@ class ForwardReader(Star):
         self.enable_direct_analysis = self.config.get("enable_direct_analysis", False) 
         self.enable_reply_analysis = self.config.get("enable_reply_analysis", False) 
     
-    async def _extract_forward_content(self, event: AiocqhttpMessageEvent, forward_id: str) -> Tuple[list[str], list[str]]:
+    async def _extract_content_recursively(self, message_nodes: List[Dict[str, Any]], extracted_texts: list[str], image_urls: list[str], depth: int = 0):
         """
-        从合并转发消息中提取文本和图片URL (仅用于标准 forward ID)。
+        核心递归解析器。遍历消息节点列表，提取文本、图片，并处理嵌套的 forward 结构。
+        该函数不执行 API 调用，只进行结构解析。
         """
-        client = event.bot 
-        try: 
-            forward_data = await client.api.call_action('get_forward_msg', id=forward_id) 
-        except Exception as e: 
-            logger.error(f"调用 get_forward_msg API 失败: {e}") 
-            raise ValueError("获取合并转发内容失败，可能是消息已过期或API问题。") 
-
-        if not forward_data or "messages" not in forward_data: 
-            raise ValueError("获取到的合并转发内容为空。") 
-
-        extracted_texts = [] 
-        image_urls = [] 
-
-        for message_node in forward_data["messages"]: 
+        indent = "  " * depth
+        
+        for message_node in message_nodes: 
             sender_name = message_node.get("sender", {}).get("nickname", "未知用户") 
             raw_content = message_node.get("message") or message_node.get("content", []) 
 
+            # 解析消息内容链 (兼容字符串和列表格式)
             content_chain = [] 
             if isinstance(raw_content, str): 
                 try: 
                     parsed_content = json.loads(raw_content) 
                     if isinstance(parsed_content, list): 
                         content_chain = parsed_content 
-                    else: 
-                        logger.debug(f"从字符串解析的内容不是列表: {parsed_content}") 
                 except (json.JSONDecodeError, TypeError): 
-                    logger.debug(f"无法将内容字符串解析为JSON，当作纯文本处理: {raw_content}") 
+                    # 无法解析为JSON的字符串内容，当作纯文本处理
                     content_chain = [{"type": "text", "data": {"text": raw_content}}] 
             elif isinstance(raw_content, list): 
                 content_chain = raw_content 
 
             node_text_parts = [] 
-            if isinstance(content_chain, list): 
+            has_only_forward = False
+            
+            # 遍历消息段，处理文本、图片和嵌套转发
+            if isinstance(content_chain, list):
+                
+                # 检查是否为纯粹的转发消息容器
+                if len(content_chain) == 1 and content_chain[0].get("type") == "forward":
+                    has_only_forward = True
+                    
                 for segment in content_chain: 
                     if isinstance(segment, dict): 
                         seg_type = segment.get("type") 
                         seg_data = segment.get("data", {}) 
+                        
                         if seg_type == "text": 
                             text = seg_data.get("text", "") 
                             if text: 
@@ -73,17 +71,51 @@ class ForwardReader(Star):
                             if url: 
                                 image_urls.append(url) 
                                 node_text_parts.append("[图片]") 
-            
-            full_node_text = "".join(node_text_parts).strip() 
-            if full_node_text: 
-                extracted_texts.append(f"{sender_name}: {full_node_text}") 
+                        
+                        elif seg_type == "forward":
+                            nested_content = seg_data.get("content")
+                            if isinstance(nested_content, list):
+                                await self._extract_content_recursively(nested_content, extracted_texts, image_urls, depth + 1)
+                                
+                            else:
+                                node_text_parts.append("[转发消息内容缺失或格式错误]")
 
+            
+            # 格式化当前消息节点的内容
+            full_node_text = "".join(node_text_parts).strip()
+            
+            if full_node_text and not has_only_forward: 
+                extracted_texts.append(f"{indent}{sender_name}: {full_node_text}")
+    
+    async def _extract_forward_content(self, event: AiocqhttpMessageEvent, forward_id: str) -> Tuple[list[str], list[str]]:
+        """
+        从合并转发消息中提取内容，并启动递归解析。
+        """
+        client = event.bot 
+        extracted_texts = [] 
+        image_urls = []
+        
+        try: 
+            # 1. 调用 API 获取转发消息详情
+            forward_data = await client.api.call_action('get_forward_msg', id=forward_id) 
+        except Exception as e: 
+            logger.warning(f"调用 get_forward_msg API 失败 (ID: {forward_id}): {e}") 
+            return [], [] 
+
+        if not forward_data or "messages" not in forward_data: 
+            logger.debug(f"获取到的合并转发内容为空或结构异常 (ID: {forward_id})")
+            return [], [] 
+
+        # 2. 启动递归解析，处理所有内嵌层级
+        await self._extract_content_recursively(forward_data["messages"], extracted_texts, image_urls, depth=0)
+        
         return extracted_texts, image_urls 
 
     @filter.on_llm_request()
     async def modify_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """
         [唤醒模式]：当 LLM 请求被框架唤醒时触发。插件将聊天记录注入到现有请求末尾。
+        此模式处理所有 is_at_or_wake_command = True 的情况。
         """
         if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent) or not event.is_at_or_wake_command:
             return
@@ -92,6 +124,7 @@ class ForwardReader(Star):
         reply_seg: Optional[Comp.Reply] = None 
         json_extracted_texts = [] 
         
+        # --- 提取转发 ID / 内容 ---
         for seg in event.message_obj.message: 
             if isinstance(seg, Comp.Forward): 
                 forward_id = seg.id 
