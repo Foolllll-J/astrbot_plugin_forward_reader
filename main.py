@@ -192,7 +192,7 @@ class ForwardReader(Star):
             
             # 2. 构建上下文
             context_prompt = (
-                f"\n\n请根据以下聊天记录内容来回答用户的问题。聊天记录如下：\n"
+                f"\n\n用户是在吐槽以下聊天记录中的内容，请根据以下聊天记录内容来响应用户的吐槽。聊天记录如下：\n"
                 f"--- 聊天记录开始 ---\n"
                 f"{chat_records}\n"
                 f"--- 聊天记录结束 ---"
@@ -315,3 +315,4 @@ class ForwardReader(Star):
         
     async def terminate(self): 
         pass
+
